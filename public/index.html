@@ -22,15 +22,21 @@
         <h2>阵营</h2>
         <div id="factions"></div>
       </section>
+
       <section>
         <h2>创建阵营</h2>
         <label>名称 <input id="f_name" placeholder="输入阵营名" /></label>
         <label>颜色 <input id="f_color" type="color" value="#e74c3c" /></label>
         <label>旗帜URL <input id="f_flag" placeholder="可选：图片URL" /></label>
-        <div class="tip">在地图上点一个格子作为初始地块</div>
+        <div class="tip">点击“进入创建模式”，在地图上浏览并选择任意未占领陆地格。</div>
+        <div style="display:flex; gap:8px; margin:6px 0;">
+          <button id="btn_create_mode">进入创建模式</button>
+          <button id="btn_cancel_mode" style="display:none;">退出创建模式</button>
+        </div>
         <button id="btn_create" disabled>创建</button>
         <div id="create_msg" class="msg"></div>
       </section>
+
       <section>
         <h2>地块信息</h2>
         <div id="tile_info">点击地图格子查看</div>

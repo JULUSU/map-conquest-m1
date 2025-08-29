@@ -17,19 +17,27 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 
 app.get('/healthz', (_req, res)=> res.send('ok'));
 
-// 获取世界状态
+// 返回世界状态 + 元信息（w/h/n），避免前端在空表时出现 -Infinity
 app.get('/api/state', async (_req, res) => {
   try {
-    const { rows: tiles } = await db.query('SELECT id,x,y,terrain,resource,owner_faction_id,population,capture FROM tiles ORDER BY id');
-    const { rows: factions } = await db.query('SELECT id,name,color,flag_url,capital_tile_id FROM factions ORDER BY id');
-    res.json({ tiles, factions });
+    const { rows: tiles } = await db.query(
+      'SELECT id,x,y,terrain,resource,owner_faction_id,population,capture FROM tiles ORDER BY id'
+    );
+    const { rows: factions } = await db.query(
+      'SELECT id,name,color,flag_url,capital_tile_id FROM factions ORDER BY id'
+    );
+    const { rows: metaRows } = await db.query(
+      'SELECT COALESCE(MAX(x),-1)+1 AS w, COALESCE(MAX(y),-1)+1 AS h, COUNT(*)::int AS n FROM tiles'
+    );
+    const meta = metaRows[0];
+    res.json({ tiles, factions, meta });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'state_failed' });
   }
 });
 
-// 获取阵营列表
+// 阵营列表
 app.get('/api/factions', async (_req, res) => {
   try {
     const { rows } = await db.query('SELECT id,name,color,flag_url,capital_tile_id FROM factions ORDER BY id');
@@ -40,15 +48,16 @@ app.get('/api/factions', async (_req, res) => {
   }
 });
 
-// 创建阵营并占领初始地块
+// 创建阵营并占领初始地块（禁止海洋 & 已占）
 app.post('/api/faction', async (req, res) => {
   const { name, color, flag_url, tile_id } = req.body || {};
   if (!name || !color || !tile_id) return res.status(400).json({ error: 'missing_fields' });
 
   try {
     await ensureSchema();
-    const { rows: trows } = await db.query('SELECT id, owner_faction_id FROM tiles WHERE id=$1', [tile_id]);
+    const { rows: trows } = await db.query('SELECT id, owner_faction_id, terrain FROM tiles WHERE id=$1', [tile_id]);
     if (!trows.length) return res.status(404).json({ error: 'tile_not_found' });
+    if (trows[0].terrain === 7) return res.status(400).json({ error: 'sea_not_allowed' });
     if (trows[0].owner_faction_id) return res.status(400).json({ error: 'tile_already_owned' });
 
     const { rows: fexist } = await db.query('SELECT 1 FROM factions WHERE name=$1', [name]);
