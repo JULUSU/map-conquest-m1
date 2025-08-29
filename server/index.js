@@ -1,8 +1,10 @@
+// server/index.js
 const express = require('express');
 const path = require('path');
 const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
+
 const db = require('./db');
 const { PORT, INIT_ON_BOOT } = require('./config');
 const { initWorld, ensureSchema } = require('./initWorld');
@@ -15,9 +17,9 @@ app.use(express.json());
 app.use(cors());
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
-app.get('/healthz', (_req, res)=> res.send('ok'));
+app.get('/healthz', (_req, res) => res.send('ok'));
 
-// 返回世界状态 + 元信息（w/h/n），避免前端在空表时出现 -Infinity
+/** 世界状态（含 meta，避免空表时 -Infinity） */
 app.get('/api/state', async (_req, res) => {
   try {
     const { rows: tiles } = await db.query(
@@ -37,10 +39,12 @@ app.get('/api/state', async (_req, res) => {
   }
 });
 
-// 阵营列表
+/** 阵营列表 */
 app.get('/api/factions', async (_req, res) => {
   try {
-    const { rows } = await db.query('SELECT id,name,color,flag_url,capital_tile_id FROM factions ORDER BY id');
+    const { rows } = await db.query(
+      'SELECT id,name,color,flag_url,capital_tile_id FROM factions ORDER BY id'
+    );
     res.json(rows);
   } catch (e) {
     console.error(e);
@@ -48,14 +52,18 @@ app.get('/api/factions', async (_req, res) => {
   }
 });
 
-// 创建阵营并占领初始地块（禁止海洋 & 已占）
+/** 创建阵营（选中未占领陆地格） */
 app.post('/api/faction', async (req, res) => {
   const { name, color, flag_url, tile_id } = req.body || {};
   if (!name || !color || !tile_id) return res.status(400).json({ error: 'missing_fields' });
 
   try {
     await ensureSchema();
-    const { rows: trows } = await db.query('SELECT id, owner_faction_id, terrain FROM tiles WHERE id=$1', [tile_id]);
+
+    const { rows: trows } = await db.query(
+      'SELECT id, owner_faction_id, terrain FROM tiles WHERE id=$1',
+      [tile_id]
+    );
     if (!trows.length) return res.status(404).json({ error: 'tile_not_found' });
     if (trows[0].terrain === 7) return res.status(400).json({ error: 'sea_not_allowed' });
     if (trows[0].owner_faction_id) return res.status(400).json({ error: 'tile_already_owned' });
@@ -69,7 +77,10 @@ app.post('/api/faction', async (req, res) => {
     );
     const faction = frows[0];
 
-    await db.query('UPDATE tiles SET owner_faction_id=$1, capture=100, population=10 WHERE id=$2', [faction.id, tile_id]);
+    await db.query(
+      'UPDATE tiles SET owner_faction_id=$1, capture=100, population=10 WHERE id=$2',
+      [faction.id, tile_id]
+    );
 
     io.emit('world:update', [{ tile_id, owner_faction_id: faction.id, capture: 100 }]);
 
@@ -80,18 +91,45 @@ app.post('/api/faction', async (req, res) => {
   }
 });
 
-io.on('connection', (socket) => {
-  console.log('socket connected', socket.id);
-  socket.on('disconnect', ()=> console.log('socket disconnected', socket.id));
+/** —— 管理：重置并重建世界（免费套餐可用）——
+ * 使用方法：
+ * 1) 在 Render 的 Environment 新增：ADMIN_RESET_KEY=你的密钥
+ * 2) 部署成功后，访问：
+ *    POST https://你的域名/admin/reset-world?key=你的密钥
+ *    成功返回 { ok: true }
+ */
+app.post('/admin/reset-world', async (req, res) => {
+  try {
+    const key = (req.query.key || req.headers['x-admin-key'] || '').toString();
+    if (!process.env.ADMIN_RESET_KEY || key !== process.env.ADMIN_RESET_KEY) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    await ensureSchema();
+    await db.query('TRUNCATE TABLE tiles RESTART IDENTITY CASCADE;');
+    await db.query('TRUNCATE TABLE factions RESTART IDENTITY CASCADE;');
+
+    // 使用当前部署的 initWorld 规则重新生成
+    await initWorld();
+
+    res.json({ ok: true, msg: 'World reset and re-initialized' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
-async function boot(){
+io.on('connection', (socket) => {
+  console.log('socket connected', socket.id);
+  socket.on('disconnect', () => console.log('socket disconnected', socket.id));
+});
+
+async function boot() {
   if (INIT_ON_BOOT) {
     try { await initWorld(); } catch (e) { console.error('initWorld failed:', e); }
   } else {
     await ensureSchema();
   }
-  server.listen(PORT, ()=> console.log('server up on', PORT));
+  server.listen(PORT, () => console.log('server up on', PORT));
 }
 
 boot();
