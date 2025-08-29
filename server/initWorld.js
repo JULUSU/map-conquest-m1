@@ -9,43 +9,84 @@ async function ensureSchema(){
   await db.query(sql);
 }
 
-/** 更低频的多八度噪声：形成大块大陆/海洋 */
-function fbm(x, y) {
-  // 频率越低，形状越大块；按需调系数（0.008 起步）
-  const o1 = hash32(Math.floor(x*0.008), Math.floor(y*0.008));
-  const o2 = hash32(Math.floor(x*0.016), Math.floor(y*0.016));
-  const o3 = hash32(Math.floor(x*0.032), Math.floor(y*0.032));
-  const o4 = hash32(Math.floor(x*0.064), Math.floor(y*0.064));
-  // 权重偏向低频
-  return (o1*0.60 + o2*0.25 + o3*0.10 + o4*0.05);
+/* =========================
+   Perlin-like 2D Gradient Noise
+   ========================= */
+// 经典 Perlin 的平滑函数
+function fade(t){ return t*t*t*(t*(t*6 - 15) + 10); } // 6t^5 - 15t^4 + 10t^3
+function lerp(a,b,t){ return a + (b-a)*t; }
+
+// 用 hash32 生成每个整点格子的单位梯度向量（角度法）
+function grad2(ix, iy){
+  const u = hash32(ix, iy);         // [0,1)
+  const ang = u * Math.PI * 2;      // 0~2π
+  return { gx: Math.cos(ang), gy: Math.sin(ang) };
 }
 
-/** 生成 elevation（0~1）与海洋掩码（7 表示海） */
+// 单次 Perlin：返回约 [-1,1]
+function perlin2(x, y){
+  const x0 = Math.floor(x), y0 = Math.floor(y);
+  const x1 = x0 + 1, y1 = y0 + 1;
+
+  const sx = fade(x - x0);
+  const sy = fade(y - y0);
+
+  const g00 = grad2(x0, y0);
+  const g10 = grad2(x1, y0);
+  const g01 = grad2(x0, y1);
+  const g11 = grad2(x1, y1);
+
+  const dx0 = x - x0, dy0 = y - y0;
+  const dx1 = x - x1, dy1 = y - y1;
+
+  const n00 = g00.gx*dx0 + g00.gy*dy0;
+  const n10 = g10.gx*dx1 + g10.gy*dy0;
+  const n01 = g01.gx*dx0 + g01.gy*dy1;
+  const n11 = g11.gx*dx1 + g11.gy*dy1;
+
+  const ix0 = lerp(n00, n10, sx);
+  const ix1 = lerp(n01, n11, sx);
+  const value = lerp(ix0, ix1, sy);
+  return value; // ~[-sqrt(0.5), sqrt(0.5)]，近似 [-1,1]
+}
+
+// 多八度 fBm，得到 [-1,1]，再归一化到 [0,1]
+function fbmPerlin(x, y, { scale=0.008, octaves=5, lacunarity=2.0, gain=0.5 } = {}){
+  // scale 越小 => 地形越“大块连片”；0.008~0.012 比较像大陆级别
+  let amp = 1, freq = 1, sum = 0, norm = 0;
+  for (let o=0; o<octaves; o++){
+    sum += amp * perlin2(x * scale * freq, y * scale * freq);
+    norm += amp;
+    amp *= gain;
+    freq *= lacunarity;
+  }
+  const v = sum / (norm || 1);      // ~[-1,1]
+  return (v + 1) * 0.5;             // => [0,1]
+}
+
+/* ============ 生成海拔 & 海陆 ============ */
 function genElevationAndSea(W, H) {
   const elev = Array.from({length:H}, ()=> Array(W));
   const sea  = Array.from({length:H}, ()=> Array(W));
-  const seaThreshold = 0.50; // 调海陆比例：0.45 少海 / 0.55 多海
+
+  // 海陆比例（阈值）：0.48~0.54 可调
+  const seaThreshold = 0.52;
 
   for (let y=0; y<H; y++){
     for (let x=0; x<W; x++){
-      let e = fbm(x, y);
+      // 大片连通的“大陆/海洋”形态来自 Perlin fBm
+      let e = fbmPerlin(x, y, { scale: 0.008, octaves: 5, lacunarity: 2.0, gain: 0.5 });
 
-      // 纬度（0 赤道，1 两极）
-      const lat = Math.abs(y/(H-1) - 0.5) * 2;
+      // 赤道（中间横线）抬升，低纬更容易成为陆地
+      const lat = Math.abs(y/(H-1) - 0.5) * 2; // 0 赤道，1 两极
+      e += (1 - lat) * 0.10;                   // 0.08~0.15 可调
+      // 高纬适度降低
+      e -= lat * 0.03;
 
-      // —— 赤道抬升：让中低纬更容易成为陆地（大块连通）
-      //   equatorBoost 越大，赤道区域越容易是陆地
-      const equatorBoost = 0.10;           // 可调：0.06~0.15
-      const equatorPower = 1.5;            // 可调：1~2，越大越集中在赤道附近
-      e += equatorBoost * Math.pow(1 - lat, equatorPower);
+      // 少量扰动避免硬边
+      e += (hash32(x+31, y+47) - 0.5) * 0.01;
 
-      // 高纬轻度压低（保留些极地海/冰原感）
-      e -= lat * 0.05;
-
-      // 轻微随机扰动，避免边界过直
-      e += (hash32(x+13, y+29) - 0.5) * 0.015;
-
-      // 夹紧
+      // 夹紧到 0..1
       e = Math.max(0, Math.min(1, e));
 
       elev[y][x] = e;
@@ -55,23 +96,23 @@ function genElevationAndSea(W, H) {
   return { elev, sea, seaThreshold };
 }
 
-/** 到海的曼哈顿距离（近似“内陆程度”） */
+/* ============ 计算到海的距离（近似“内陆程度”） ============ */
 function distanceToSea(sea, W, H){
   const INF = 1e9;
   const dist = Array.from({length:H}, ()=> Array(W).fill(INF));
   const qx = [], qy = [];
-  for (let y=0; y<H; y++) for (let x=0; x<W; x++) {
+  for (let y=0;y<H;y++) for (let x=0;x<W;x++){
     if (sea[y][x]) { dist[y][x]=0; qx.push(x); qy.push(y); }
   }
-  let head = 0;
+  let head=0;
   const DX=[1,-1,0,0], DY=[0,0,1,-1];
   while (head<qx.length){
     const x=qx[head], y=qy[head]; head++;
-    const d = dist[y][x] + 1;
+    const d=dist[y][x]+1;
     for (let k=0;k<4;k++){
       const nx=x+DX[k], ny=y+DY[k];
       if (nx<0||ny<0||nx>=W||ny>=H) continue;
-      if (d < dist[ny][nx]) { dist[ny][nx]=d; qx.push(nx); qy.push(ny); }
+      if (d<dist[ny][nx]){ dist[ny][nx]=d; qx.push(nx); qy.push(ny); }
     }
   }
   let maxD=1;
@@ -79,55 +120,44 @@ function distanceToSea(sea, W, H){
   return { dist, maxD };
 }
 
-/** 根据 “内陆程度 + 纬度” 映射 1..6（7=海）——赤道更优良 */
+/* ============ 从海拔/纬度/内陆度映射到 1..6（7=海） ============ */
 function terrainFrom(elev, sea, distSea, maxD, x, y, H){
   if (sea[y][x]) return 7;
 
-  const continental = Math.min(1, distSea[y][x] / maxD);       // 内陆程度越大→越恶劣
-  const lat = Math.abs(y/(H-1) - 0.5) * 2;                     // 0 赤道、1 两极
+  const continental = Math.min(1, distSea[y][x] / maxD); // 离海越远越“内陆”
+  const lat = Math.abs(y/(H-1) - 0.5) * 2;
 
-  // 恶劣度：显著降低低纬度（靠近中线越优良）
-  //   - continental：产生内陆越恶劣
-  //   - lat：高纬更恶劣，但权重较低
-  //   - equatorFavor：对赤道强力加成（降低恶劣度）
-  let harsh = continental * 0.65 + lat * 0.15 + (elev[y][x])*0.05;
-  const equatorFavor = 0.35;                 // 可调：0.25~0.45，越大越“赤道友好”
-  harsh -= equatorFavor * Math.pow(1 - lat, 1.2);
-
-  // 少量随机，避免硬边
-  harsh += (hash32(x+5, y+9) - 0.5) * 0.06;
+  // 恶劣度：内陆为主，纬度次之；赤道明显更优
+  let harsh = continental * 0.60 + lat * 0.15 + elev[y][x] * 0.10;
+  harsh -= (1 - lat) * 0.30; // 赤道友好（0.25~0.40 可调）
+  harsh += (hash32(x+7, y+9) - 0.5) * 0.05;
 
   harsh = Math.max(0, Math.min(1, harsh));
-  const level = 1 + Math.floor(harsh * 6);   // 1..7
+  const level = 1 + Math.floor(harsh * 6);
   return Math.min(6, Math.max(1, level));
 }
 
 function baseResource(terrain){
-  // 等级越低（更优良）→ 资源越高
-  const max = 1.60, min = 0.30;   // 小幅提高上限，凸显优良地块
-  const steps = 6;
-  const rank = (terrain - 1);
-  const v = max - (max - min) * (rank / (steps - 1));
-  return v;
+  const max = 1.6, min = 0.30; // 等级小→资源高
+  const rank = terrain - 1;    // 0..5
+  return max - (max - min) * (rank / 5);
 }
 
+/* ============ 主初始化流程 ============ */
 async function initWorld({width=WORLD_W, height=WORLD_H}={}){
   await ensureSchema();
-
   const { rows: countRows } = await db.query('SELECT COUNT(*)::int AS n FROM tiles');
-  if (countRows[0].n > 0) {
-    console.log('[initWorld] 已存在 tiles，跳过初始化。');
-    return;
-  }
+  if (countRows[0].n > 0) { console.log('[initWorld] 已存在 tiles，跳过初始化。'); return; }
+
   console.log(`[initWorld] 生成世界 ${width}x${height} ...`);
 
-  // 1) 大块海陆形态 + elevation
+  // 1) 海拔 & 海陆（Perlin fBm 大片连通）
   const { elev, sea } = genElevationAndSea(width, height);
 
-  // 2) 距海距离 => 内陆程度（决定恶劣度基调）
+  // 2) 内陆程度
   const { dist, maxD } = distanceToSea(sea, width, height);
 
-  // 3) 批量写入
+  // 3) 批量入库
   const batchSize = 2000;
   const values = [];
   let inserted = 0;
