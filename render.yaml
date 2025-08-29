@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: map-conquest-m1
+    env: node
+    buildCommand: "npm ci"
+    startCommand: "npm start"
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: INIT_ON_BOOT
+        value: "true"
+      - key: WORLD_W
+        value: "200"
+      - key: WORLD_H
+        value: "120"

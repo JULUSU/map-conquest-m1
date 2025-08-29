@@ -1,0 +1,88 @@
+const express = require('express');
+const path = require('path');
+const cors = require('cors');
+const http = require('http');
+const { Server } = require('socket.io');
+const db = require('./db');
+const { PORT, INIT_ON_BOOT } = require('./config');
+const { initWorld, ensureSchema } = require('./initWorld');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+
+app.use(express.json());
+app.use(cors());
+app.use(express.static(path.join(__dirname, '..', 'public')));
+
+app.get('/healthz', (_req, res)=> res.send('ok'));
+
+// 获取世界状态
+app.get('/api/state', async (_req, res) => {
+  try {
+    const { rows: tiles } = await db.query('SELECT id,x,y,terrain,resource,owner_faction_id,population,capture FROM tiles ORDER BY id');
+    const { rows: factions } = await db.query('SELECT id,name,color,flag_url,capital_tile_id FROM factions ORDER BY id');
+    res.json({ tiles, factions });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'state_failed' });
+  }
+});
+
+// 获取阵营列表
+app.get('/api/factions', async (_req, res) => {
+  try {
+    const { rows } = await db.query('SELECT id,name,color,flag_url,capital_tile_id FROM factions ORDER BY id');
+    res.json(rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'factions_failed' });
+  }
+});
+
+// 创建阵营并占领初始地块
+app.post('/api/faction', async (req, res) => {
+  const { name, color, flag_url, tile_id } = req.body || {};
+  if (!name || !color || !tile_id) return res.status(400).json({ error: 'missing_fields' });
+
+  try {
+    await ensureSchema();
+    const { rows: trows } = await db.query('SELECT id, owner_faction_id FROM tiles WHERE id=$1', [tile_id]);
+    if (!trows.length) return res.status(404).json({ error: 'tile_not_found' });
+    if (trows[0].owner_faction_id) return res.status(400).json({ error: 'tile_already_owned' });
+
+    const { rows: fexist } = await db.query('SELECT 1 FROM factions WHERE name=$1', [name]);
+    if (fexist.length) return res.status(400).json({ error: 'name_taken' });
+
+    const { rows: frows } = await db.query(
+      'INSERT INTO factions(name,color,flag_url,capital_tile_id) VALUES($1,$2,$3,$4) RETURNING id,name,color,flag_url,capital_tile_id',
+      [name, color, flag_url || null, tile_id]
+    );
+    const faction = frows[0];
+
+    await db.query('UPDATE tiles SET owner_faction_id=$1, capture=100, population=10 WHERE id=$2', [faction.id, tile_id]);
+
+    io.emit('world:update', [{ tile_id, owner_faction_id: faction.id, capture: 100 }]);
+
+    res.json({ ok: true, faction, updated_tile: { id: tile_id, owner_faction_id: faction.id, capture: 100 } });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'create_failed' });
+  }
+});
+
+io.on('connection', (socket) => {
+  console.log('socket connected', socket.id);
+  socket.on('disconnect', ()=> console.log('socket disconnected', socket.id));
+});
+
+async function boot(){
+  if (INIT_ON_BOOT) {
+    try { await initWorld(); } catch (e) { console.error('initWorld failed:', e); }
+  } else {
+    await ensureSchema();
+  }
+  server.listen(PORT, ()=> console.log('server up on', PORT));
+}
+
+boot();
